@@ -19,10 +19,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from dotenv import dotenv_values
 from mcp.server.fastmcp import FastMCP
@@ -32,7 +34,16 @@ from telethon.errors import (
     RPCError,
     UserBannedInChannelError,
     ChatWriteForbiddenError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
+    InviteRequestSentError,
+    UserAlreadyParticipantError,
+    UserNotParticipantError,
+    ChannelPrivateError,
+    ChatAdminRequiredError,
 )
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.tl.types import (
     Channel,
     Chat,
@@ -69,6 +80,75 @@ _index_refreshing = False
 
 class NotAuthorized(Exception):
     """Session exists but is not a logged-in user account."""
+
+
+def _parse_telegram_target(target: str) -> tuple[str, str, Optional[int]]:
+    """Parse a Telegram handle/link without contacting Telegram.
+
+    Returns (kind, value, post_id); kind is username or invite. Never include
+    the invite hash in diagnostics or responses.
+    """
+    if not isinstance(target, str) or not target.strip():
+        raise ValueError("Укажите @username или ссылку t.me.")
+    value = target.strip()
+    if value.startswith("@"):
+        username = value[1:]
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", username):
+            raise ValueError("Некорректный @username Telegram.")
+        return "username", username, None
+    candidate = value if "://" in value else "https://" + value
+    parsed = urlparse(candidate)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ("t.me", "www.t.me", "telegram.me", "www.telegram.me"):
+        raise ValueError("Допустимы только @username и ссылки t.me.")
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) == 1 and parts[0].startswith("+") and re.fullmatch(r"\+[A-Za-z0-9_-]+", parts[0]):
+        return "invite", parts[0][1:], None
+    if len(parts) == 2 and parts[0].lower() == "joinchat" and re.fullmatch(r"[A-Za-z0-9_-]+", parts[1]):
+        return "invite", parts[1], None
+    if parts and parts[0].lower() == "s":
+        parts = parts[1:]
+    if not parts or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", parts[0]):
+        raise ValueError("Ссылка не содержит публичный username или поддерживаемое приглашение.")
+    post_id = None
+    if len(parts) == 2 and parts[1].isdigit():
+        post_id = int(parts[1])
+    elif len(parts) != 1:
+        raise ValueError("Ссылка Telegram имеет неподдерживаемый формат.")
+    return "username", parts[0], post_id
+
+
+def _entity_kind(entity) -> str:
+    if isinstance(entity, Channel):
+        return "канал" if getattr(entity, "broadcast", False) else "группа/супергруппа"
+    if isinstance(entity, Chat):
+        return "группа"
+    if isinstance(entity, User):
+        return "пользователь"
+    return "сообщество Telegram"
+
+
+def _entity_result(entity, status: str) -> dict[str, Any]:
+    username = getattr(entity, "username", None)
+    return {"title": getattr(entity, "title", None) or getattr(entity, "first_name", None) or "Без названия",
+            "type": _entity_kind(entity), "username": f"@{username}" if username else None,
+            "participation": status}
+
+
+async def _get_membership(client, entity, me_id: int) -> str:
+    """Inspect membership when Telegram permits it; fail closed to unknown."""
+    from telethon.tl.functions.channels import GetParticipantRequest
+    from telethon.errors import UserNotParticipantError
+    if not isinstance(entity, Channel):
+        return "unknown"
+    try:
+        await client(GetParticipantRequest(entity, me_id))
+        return "member"
+    except UserNotParticipantError:
+        return "not_member"
+    except (ChannelPrivateError, ChatAdminRequiredError):
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -384,6 +464,133 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     if dt.tzinfo is None:
         dt = dt.astimezone()  # interpret bare dates in local (MSK) time
     return dt.astimezone(timezone.utc)
+
+
+# --------------------------------------------------------------------------- #
+# public discovery and explicit membership
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+async def preview_telegram_chat(target: str) -> str:
+    """Preview a Telegram public handle or invite without joining. Accepts a @username, t.me link, or private invite. For a post URL, previews its parent channel."""
+    try:
+        kind, value, post_id = _parse_telegram_target(target)
+    except ValueError as exc:
+        return _dump(_err("bad_target", hint=str(exc)))
+
+    async def operation(client):
+        try:
+            if kind == "username":
+                entity = await client.get_entity(value)
+                me = await client.get_me()
+                status = await _get_membership(client, entity, me.id)
+                return _entity_result(entity, status)
+            else:
+                invite = await client(CheckChatInviteRequest(value))
+                entity = getattr(invite, "chat", None)
+                if entity is None:
+                    return {"ok": True, "result": {"title": "Приватное сообщество по приглашению",
+                            "type": "приватное сообщество", "username": None,
+                            "participation": "not_member", "preview_limited": True}}
+            me = await client.get_me()
+            status = await _get_membership(client, entity, me.id)
+            return _entity_result(entity, status)
+        except InviteHashExpiredError:
+            return _err("invite_expired", detail="Приглашение истекло или отозвано.")
+        except InviteHashInvalidError:
+            return _err("telegram_rejected", detail="Приглашение недействительно.")
+        except Exception as exc:
+            return _err("preview_failed", detail=_safe_telegram_error(exc))
+
+    try:
+        result = await _run(operation)
+        return _dump(result)
+    except Exception as exc:
+        return _dump(_err("preview_failed", detail=_safe_telegram_error(exc)))
+
+
+def _safe_telegram_error(exc: Exception) -> str:
+    if isinstance(exc, InviteHashExpiredError):
+        return "Приглашение истекло или отозвано."
+    if isinstance(exc, InviteHashInvalidError):
+        return "Приглашение недействительно."
+    if isinstance(exc, ChannelPrivateError):
+        return "Это приватное сообщество; нужен действующий инвайт."
+    return f"{type(exc).__name__}; Telegram не предоставил данные сообщества."
+
+
+def _join_error_result(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, InviteRequestSentError):
+        return {"status": "request_sent", "message": "Заявка отправлена на модерацию; повторно не отправляю."}
+    if isinstance(exc, UserAlreadyParticipantError):
+        return {"status": "already_member", "message": "Вы уже состоите в сообществе."}
+    if isinstance(exc, InviteHashExpiredError):
+        return {"status": "invite_expired", "message": "Приглашение истекло или отозвано."}
+    if isinstance(exc, InviteHashInvalidError):
+        return {"status": "telegram_rejected", "message": "Telegram отклонил приглашение: ссылка недействительна."}
+    return {"status": "telegram_rejected", "message": _safe_telegram_error(exc)}
+
+
+@mcp.tool()
+async def join_telegram_chat(target: str) -> str:
+    """Join the exact Telegram community specified by @username or invite link, only when explicitly requested by the user."""
+    try:
+        kind, value, post_id = _parse_telegram_target(target)
+        if post_id is not None:
+            return _dump(_err("bad_target", hint="Для вступления укажите @username или ссылку на сообщество, не на отдельный пост."))
+    except ValueError as exc:
+        return _dump(_err("bad_target", hint=str(exc)))
+
+    if kind == "username":
+        async def public_join(client):
+            entity = await client.get_entity(value)
+            me = await client.get_me()
+            membership = await _get_membership(client, entity, me.id)
+            if membership == "member":
+                return {"status": "already_member", **_entity_result(entity, "member")}
+            if membership != "not_member":
+                return {"status": "telegram_rejected", "message": "Не удалось надёжно проверить участие; вступление не выполнялось."}
+            try:
+                await client(JoinChannelRequest(entity))
+            except Exception as exc:
+                return _join_error_result(exc)
+            verify = await _get_membership(client, entity, me.id)
+            if verify != "member":
+                return {"status": "telegram_rejected", "message": "Запрос отправлен, но участие не подтверждено."}
+            return {"status": "joined", **_entity_result(entity, "member")}
+        try:
+            return _dump(await _run(public_join))
+        except Exception as exc:
+            return _dump(_join_error_result(exc))
+
+    async def invite_join(client):
+        try:
+            preview = await client(CheckChatInviteRequest(value))
+        except Exception as exc:
+            return _join_error_result(exc)
+        entity = getattr(preview, "chat", None)
+        if entity is not None:
+            me = await client.get_me()
+            membership = await _get_membership(client, entity, me.id)
+            if membership == "member":
+                return {"status": "already_member", **_entity_result(entity, "member")}
+        try:
+            updates = await client(ImportChatInviteRequest(value))
+        except Exception as exc:
+            return _join_error_result(exc)
+        joined = getattr(updates, "chats", None) or []
+        if entity is None and joined:
+            entity = joined[0]
+        if entity is None:
+            return {"status": "telegram_rejected", "message": "Telegram не вернул данные сообщества после вступления."}
+        me = await client.get_me()
+        verify = await _get_membership(client, entity, me.id)
+        if verify != "member":
+            return {"status": "telegram_rejected", "message": "Telegram не подтвердил вступление по приглашению."}
+        return {"status": "joined", **_entity_result(entity, "member")}
+    try:
+        return _dump(await _run(invite_join))
+    except Exception as exc:
+        return _dump(_join_error_result(exc))
 
 
 # --------------------------------------------------------------------------- #

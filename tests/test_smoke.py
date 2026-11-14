@@ -9,7 +9,7 @@ class ToolSmokeTests(unittest.TestCase):
         expected = {
             "unread_digest", "find_chat", "recent_messages", "search_messages",
             "download_attachment", "send_message", "send_file", "edit_message",
-            "delete_message", "send_temporary_message",
+            "delete_message", "send_temporary_message", "preview_telegram_chat", "join_telegram_chat",
         }
         self.assertTrue(expected.issubset(set(server.mcp._tool_manager._tools)))
 
