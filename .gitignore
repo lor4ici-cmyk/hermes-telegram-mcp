@@ -1,0 +1,22 @@
+# Secrets and Telegram session files
+.env
+*.env
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+
+# Python environments and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# Logs and backups
+*.log
+*.bak
+*.backup
+backups/
