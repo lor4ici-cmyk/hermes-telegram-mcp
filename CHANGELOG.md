@@ -2,7 +2,10 @@
 
 ## [1.0.0] - 2026-11-14
 
-- Initial release of the Telegram MCP server for Hermes.
-- Read tools: unread digest, chat lookup, recent messages and text search.
-- Explicit actions: download attachment, send text/file, edit/delete own messages, temporary message.
-- QR-based interactive Telethon login.
+Первый релиз Hermes Telegram MCP.
+
+Возможности: дайджест непрочитанного, поиск чатов, просмотр последних сообщений и поиск по истории; загрузка вложений; явная отправка текста/файлов, редактирование и удаление своих сообщений, временное сообщение; QR-вход через Telethon и stdio MCP для Hermes.
+
+Установка: Linux, Python 3.10+; создайте venv, установите `requirements.txt`, задайте `TELEGRAM_API_ID` и `TELEGRAM_API_HASH` в `~/.hermes/.env`, выполните `python login.py` и настройте `mcp_servers` по README. Сессию можно отозвать в Telegram → Настройки → Устройства.
+
+Проверки: 3 unit-теста успешны; отправка/удаление тестировались только на mock-клиенте; зарегистрированы 10 MCP-инструментов.
